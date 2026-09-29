@@ -105,6 +105,12 @@ const (
 	ReasonRejectQueueFull ReasonCode = "REJECT_QUEUE_FULL"
 	// ReasonNotFound 取消/查询时作业不存在。
 	ReasonNotFound ReasonCode = "NOT_FOUND"
+	// ReasonRequeueMaintenance 计划维护：作业被迁离维护节点并重新排队。
+	ReasonRequeueMaintenance ReasonCode = "REQUEUED_MAINTENANCE"
+	// ReasonRequeueGroupInterrupt 整组重排队：组内有成员被中断（维护迁移或故障）。
+	ReasonRequeueGroupInterrupt ReasonCode = "REQUEUED_GROUP_INTERRUPTED"
+	// ReasonRequeueEvicted 突发故障：作业被驱逐并重新排队。
+	ReasonRequeueEvicted ReasonCode = "REQUEUED_EVICTED"
 )
 
 // QueueConfig 描述一个队列的静态配置。
@@ -122,12 +128,15 @@ type Queue struct {
 	pending []string
 }
 
-// NodeState 表示节点健康状态。
+// NodeState 表示节点健康/可调度状态。
 type NodeState int
 
 const (
 	NodeHealthy NodeState = iota
 	NodeUnhealthy
+	// NodeDraining 计划维护下线中：节点存活但不接收新作业，
+	// 其上作业被迁移或等待自然结束（drain）。与突发故障 NodeUnhealthy 相区分。
+	NodeDraining
 )
 
 func (s NodeState) String() string {
@@ -136,6 +145,8 @@ func (s NodeState) String() string {
 		return "HEALTHY"
 	case NodeUnhealthy:
 		return "UNHEALTHY"
+	case NodeDraining:
+		return "DRAINING"
 	default:
 		return "UNKNOWN"
 	}
@@ -148,7 +159,25 @@ type Node struct {
 	available Resources // 未分配资源
 	state     NodeState
 	jobs      map[string]Resources // 当前占用该节点的作业 -> 占用量
+
+	// 维护状态元数据（仅 state == NodeDraining 时有效）。
+	maintReason  string
+	maintStarted time.Time
 }
+
+// State 返回节点当前状态。
+func (n *Node) State() NodeState { return n.state }
+
+// MaintenanceInfo 返回维护原因与进入维护的时间；非维护中时 ok 为 false。
+func (n *Node) MaintenanceInfo() (reason string, at time.Time, ok bool) {
+	if n.state != NodeDraining {
+		return "", time.Time{}, false
+	}
+	return n.maintReason, n.maintStarted, true
+}
+
+// Drained 判断节点是否已清空：维护中且无运行作业，可安全重启/下线。
+func (n *Node) Drained() bool { return n.state == NodeDraining && len(n.jobs) == 0 }
 
 // Job 描述一个批作业。
 type Job struct {

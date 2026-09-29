@@ -1,5 +1,5 @@
 // hpcsim 是本地批调度器的可运行演示：
-// 构造节点与多队列，提交普通作业、作业组，制造资源不足与节点故障，
+// 构造节点与多队列，提交普通作业、作业组，制造资源不足、计划维护与节点故障，
 // 打印分配流水、排队/拒绝原因与资源守恒校验结论。
 package main
 
@@ -29,6 +29,7 @@ func main() {
 	s := scheduler.New()
 	must(s.AddNode("node-a", scheduler.Resources{CPU: 8, MemoryMB: 32768, GPU: 2}))
 	must(s.AddNode("node-b", scheduler.Resources{CPU: 8, MemoryMB: 32768, GPU: 2}))
+	must(s.AddNode("node-c", scheduler.Resources{CPU: 8, MemoryMB: 32768, GPU: 2}))
 	must(s.AddQueue(scheduler.QueueConfig{Name: "batch", Weight: 2, Priority: 5}))
 	must(s.AddQueue(scheduler.QueueConfig{Name: "accel", Weight: 1, Priority: 3, MaxJobs: 6}))
 
@@ -61,21 +62,50 @@ func main() {
 	must(s.Complete("j1"))
 	show(s, "after completing j1: queued jobs rescheduled")
 
-	// 6) 节点故障：驱逐运行作业并把资源释放，被驱逐作业重新排队、可迁移
+	// 6) 计划维护（DRAINING）：node-b 不再接收新作业；
+	//    其上单作业尽力迁走；若有组成员则整组（含健康节点上的同伴）一起重排队。
+	must(s.MarkNodeMaintenance("node-b", "rolling kernel upgrade"))
+	drained, err := s.NodeDrained("node-b")
+	must(err)
+	fmt.Printf("node-b maintenance requested; drained=%v (true = safe to reboot)\n", drained)
+	show(s, "node-b draining: migration + whole-group requeue, no new placements")
+
+	// 维护期间提交照常工作：只会被放到健康节点，放不下就排队
+	r5 := s.Submit(scheduler.Job{ID: "j-maint", Queue: "batch", Request: scheduler.Resources{CPU: 1, MemoryMB: 1024}})
+	fmt.Printf("submit during maintenance => accepted=%v state=%s reason=%s\n", r5.Accepted, r5.State, r5.Reason)
+
+	// j2(6cpu/2gpu) 此刻迁不走（健康节点没有 2 张空闲 GPU），它在 node-b 上继续运行。
+	// 完成占用 node-a 两张 GPU 的 j3 后出现容纳空间：下一轮调度立即把 j2
+	// 通过 MIGRATE 流水平移到 node-a 继续运行（不重排队、不重置起始时间）。
+	must(s.Complete("j3"))
+	if j, ok := s.GetJob("j2"); ok {
+		fmt.Printf("j2 after capacity freed => state=%s node=%s (migrated off draining node-b)\n", j.State, j.NodeName)
+	}
+	drained, err = s.NodeDrained("node-b")
+	must(err)
+	fmt.Printf("node-b drained=%v (true = safe to reboot)\n", drained)
+	show(s, "maintenance window: j2 migrated via MIGRATE, node-b drained")
+
+	// 7) 取消维护：node-b 立即回到正常调度，排队作业可被安置回来
+	must(s.CancelMaintenance("node-b"))
+	show(s, "maintenance cancelled: node-b serves again")
+
+	// 8) 节点故障：驱逐运行作业并把资源释放，被驱逐作业重新排队、可迁移；
+	//    流水类型为 EVICT/GROUP_REQUEUE，与计划维护的 MIGRATE 明确区分。
 	must(s.MarkNodeUnhealthy("node-b"))
 	show(s, "node-b unhealthy: evicted jobs requeued, resources released")
 
-	// 7) 推进若干周期，观察老化（低优先级不被饿死）
+	// 9) 推进若干周期，观察老化（低优先级不被饿死）
 	for i := 0; i < 6; i++ {
 		s.Tick()
 	}
 	show(s, "after aging ticks")
 
-	// 8) 节点恢复，排队作业应再次被安置
+	// 10) 节点恢复，排队作业应再次被安置
 	must(s.MarkNodeHealthy("node-b"))
 	show(s, "node-b healthy again")
 
-	// 9) 非法请求 => 拒绝原因与排队明确区分
+	// 11) 非法请求 => 拒绝原因与排队明确区分
 	bad := s.Submit(scheduler.Job{ID: "j-zero", Queue: "batch", Request: scheduler.Resources{}})
 	fmt.Printf("\nsubmit j-zero => accepted=%v reason=%s | %s\n", bad.Accepted, bad.Reason, bad.Detail)
 	missing := s.Submit(scheduler.Job{ID: "j-x", Queue: "nope", Request: scheduler.Resources{CPU: 1}})

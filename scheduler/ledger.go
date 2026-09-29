@@ -12,15 +12,19 @@ import (
 type EventType string
 
 const (
-	EvAllocate EventType = "ALLOCATE"  // 分配资源给作业
-	EvRelease  EventType = "RELEASE"   // 作业完成/取消，正常归还
-	EvEvict    EventType = "EVICT"     // 节点故障，作业被驱逐（占用被强制释放）
-	EvNodeDown EventType = "NODE_DOWN" // 节点转为不健康
-	EvNodeUp   EventType = "NODE_UP"   // 节点恢复健康
-	EvReject   EventType = "REJECT"    // 提交被拒绝
-	EvQueue    EventType = "QUEUE"     // 资源不足进入排队
-	EvCancel   EventType = "CANCEL"    // 排队作业被取消（无资源量变动）
-	EvComplete EventType = "COMPLETE"  // 作业完成（无资源量变动的备注事件）
+	EvAllocate     EventType = "ALLOCATE"      // 分配资源给作业
+	EvRelease      EventType = "RELEASE"       // 作业完成/取消，正常归还
+	EvEvict        EventType = "EVICT"         // 节点突发故障，作业被驱逐（占用被强制释放）
+	EvMigrate      EventType = "MIGRATE"       // 计划维护，作业被迁离维护节点（占用在源节点释放）
+	EvGroupRequeue EventType = "GROUP_REQUEUE" // 整组中断：健康节点上的同组成员一并停下重排队
+	EvNodeDown     EventType = "NODE_DOWN"     // 节点突发故障（UNHEALTHY）
+	EvNodeUp       EventType = "NODE_UP"       // 节点从故障恢复健康
+	EvNodeDrain    EventType = "NODE_DRAIN"    // 节点进入计划维护（DRAINING，不接收新作业）
+	EvNodeReady    EventType = "NODE_READY"    // 维护被取消，节点回到正常调度
+	EvReject       EventType = "REJECT"        // 提交被拒绝
+	EvQueue        EventType = "QUEUE"         // 资源不足进入排队
+	EvCancel       EventType = "CANCEL"        // 排队作业被取消（无资源量变动）
+	EvComplete     EventType = "COMPLETE"      // 作业完成（无资源量变动的备注事件）
 )
 
 // LedgerEvent 是一条不可变的资源分配流水。
@@ -121,7 +125,7 @@ func (l *Ledger) record(evType EventType, jobID, node, queue string, delta Resou
 		switch evType {
 		case EvAllocate:
 			cur = cur.Add(delta)
-		case EvRelease, EvEvict:
+		case EvRelease, EvEvict, EvMigrate, EvGroupRequeue:
 			cur = cur.Sub(delta)
 		}
 		l.allocated[node] = cur
@@ -143,6 +147,16 @@ func (l *Ledger) Release(jobID, node, queue string, req Resources, detail string
 // Evict 记录一次故障驱逐导致的强制释放。
 func (l *Ledger) Evict(jobID, node, queue string, req Resources, detail string) LedgerEvent {
 	return l.record(EvEvict, jobID, node, queue, req, ReasonOK, detail)
+}
+
+// Migrate 记录计划维护导致的一次迁离（占用在源节点释放，随后重新排队）。
+func (l *Ledger) Migrate(jobID, node, queue string, req Resources, reason ReasonCode, detail string) LedgerEvent {
+	return l.record(EvMigrate, jobID, node, queue, req, reason, detail)
+}
+
+// GroupRequeue 记录整组中断：健康节点上的同组成员被一并停下（占用释放）。
+func (l *Ledger) GroupRequeue(jobID, node, queue string, req Resources, reason ReasonCode, detail string) LedgerEvent {
+	return l.record(EvGroupRequeue, jobID, node, queue, req, reason, detail)
 }
 
 // Note 记录不改变资源量的判定事件（拒绝/排队/节点上下线）。
