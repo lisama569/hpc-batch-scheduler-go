@@ -105,6 +105,15 @@ const (
 	ReasonRejectQueueFull ReasonCode = "REJECT_QUEUE_FULL"
 	// ReasonNotFound 取消/查询时作业不存在。
 	ReasonNotFound ReasonCode = "NOT_FOUND"
+	// ReasonQueuedGroupInterrupted 作业组因成员被中断（计划维护迁移或
+	// 节点故障）而整组停止、回到排队状态重新竞争资源。
+	ReasonQueuedGroupInterrupted ReasonCode = "QUEUED_GROUP_INTERRUPTED"
+	// ReasonMigratedMaintenance 作业因计划维护从维护节点迁移到健康节点
+	// （ALLOCATE 流水携带，用于区分常规放置）。
+	ReasonMigratedMaintenance ReasonCode = "MIGRATED_MAINTENANCE"
+	// ReasonMaintenanceDrainPending 维护节点上的非组作业当前迁不走，
+	// 仍留在原节点继续运行，等待维护窗口内自然结束或下一轮迁移。
+	ReasonMaintenanceDrainPending ReasonCode = "MAINTENANCE_DRAIN_PENDING"
 )
 
 // QueueConfig 描述一个队列的静态配置。
@@ -122,12 +131,17 @@ type Queue struct {
 	pending []string
 }
 
-// NodeState 表示节点健康状态。
+// NodeState 表示节点运行状态。
 type NodeState int
 
 const (
+	// NodeHealthy 健康：正常参与调度、接收新作业。
 	NodeHealthy NodeState = iota
+	// NodeUnhealthy 突发故障：节点不可用，其上作业被强制驱逐（EVICT）。
 	NodeUnhealthy
+	// NodeMaintenance 计划维护下线：节点不再接收新作业，剩余容量不计入
+	// 可放置容量；其上作业可在维护窗口内被迁移或等待自然结束。
+	NodeMaintenance
 )
 
 func (s NodeState) String() string {
@@ -136,6 +150,8 @@ func (s NodeState) String() string {
 		return "HEALTHY"
 	case NodeUnhealthy:
 		return "UNHEALTHY"
+	case NodeMaintenance:
+		return "MAINTENANCE"
 	default:
 		return "UNKNOWN"
 	}

@@ -1,20 +1,21 @@
 # HPC Batch Scheduler（本地内存态批作业调度与资源核算）
 
 一个不依赖外部集群的本地批作业调度器：用互斥锁保护的内存节点表与队列表
-模拟集群，目标是在**并发提交、资源不足、节点故障**三类情形下，让调度结论
-**一致、可复现、可解释**，并保证资源账目始终守恒。
+模拟集群，目标是在**并发提交、资源不足、节点故障、计划维护下线**四类情形下，
+让调度结论**一致、可复现、可解释**，并保证资源账目始终守恒。
 
 ## 目录结构
 
 ```
 scheduler/
-  types.go       资源、作业、节点、队列等核心类型与状态枚举
+  types.go       资源、作业、节点、队列等核心类型与状态枚举（含 NodeMaintenance）
   scheduler.go   调度器：提交/排队/取消/完成/故障恢复/公平调度主循环
   fairness.go    加权轮转（WRR）与作业老化（aging）
-  ledger.go      资源流水账目（ALLOCATE/RELEASE/EVICT/…）与守恒校验
+  maintenance.go 计划维护下线：进入/排空/状态查询/取消、迁移、整组中断
+  ledger.go      资源流水账目（ALLOCATE/RELEASE/EVICT/MIGRATE/…）与守恒校验
   errors.go      哨兵错误
-  *_test.go      并发、作业组、故障回收、公平性、可复现性、账目测试
-cmd/hpcsim/      可运行演示（main.go）
+  *_test.go      并发、作业组、故障回收、维护迁移、公平性、可复现性、账目测试
+cmd/hpcsim/      可运行演示（main.go：基础场景 + 独立的计划维护场景）
 ```
 
 ## 资源模型
@@ -51,6 +52,9 @@ cmd/hpcsim/      可运行演示（main.go）
 | 队列不存在 | false | `REJECTED` | `REJECT_NO_QUEUE` |
 | 队列在途作业达到 `MaxJobs` | false | `REJECTED` | `REJECT_QUEUE_FULL` |
 | 组成员组 ID 不一致等 | false | `REJECTED` | `REJECT_GROUP_MISMATCH` |
+| 作业组因成员被中断（维护/故障）而整组重排队 | true | `QUEUED` | `QUEUED_GROUP_INTERRUPTED` |
+| 维护迁移在健康节点重新落地（ALLOCATE 原因） | true | `RUNNING` | `MIGRATED_MAINTENANCE` |
+| 维护节点上的作业暂时迁不走、等待自然结束 | true | `RUNNING` | `MAINTENANCE_DRAIN_PENDING` |
 
 关键区分：**“排队”是被接受但暂时放不下**（资源归还后会再调度），
 **“拒绝”是根本不会排队**（非法或永远不可行）。
@@ -110,6 +114,91 @@ cmd/hpcsim/      可运行演示（main.go）
 - 每次驱逐都会在流水里留下成对的 `EVICT`（释放量扣减）与重新排队备注事件，
   判定依据可追溯。
 
+## 计划维护下线（Planned Maintenance）
+
+运维可主动把节点置为维护中（滚动升级、硬件保养等）。**维护与突发故障是两种
+不同的节点状态、两套不同流水，语义严格区分：**
+
+| 维度 | 计划维护 `NodeMaintenance` | 突发故障 `NodeUnhealthy` |
+|---|---|---|
+| 触发方式 | 运维主动 `MarkNodeMaintenance` | `MarkNodeUnhealthy` |
+| 节点上作业 | **可迁走继续跑**，或等待自然结束（不强制清空） | **强制全部驱逐** |
+| 资源释放流水 | 维护节点成员 `MIGRATE`；健康伙伴 `GROUP_REQUEUE` | 故障节点成员 `EVICT`；健康伙伴 `GROUP_REQUEUE` |
+| 节点状态流水 | `NODE_MAINTENANCE` / `NODE_READY`（取消） | `NODE_DOWN` / `NODE_UP` |
+| 可否取消恢复 | 可 `CancelNodeMaintenance`，留在节点上的作业继续运行 | 只能 `MarkNodeHealthy`（节点已空、可用量复位） |
+| 期间是否收新作业 | 否，剩余可用量不计入可放置容量 | 否 |
+
+### 接口
+
+```go
+// 进入维护：不接收新作业，并立即执行一轮尽力而为排空，返回排空结论。
+res, err := s.MarkNodeMaintenance("node-x") // (DrainResult, error)
+
+// 维护窗口内再执行一轮排空（滚动升级中可周期性重试）。
+res, err = s.DrainNode("node-x")
+
+// 运维据此判断能否安全重启：Drained==true 即节点已无运行作业。
+st, err := s.DrainStatus("node-x") // NodeDrainStatus{State,Running,InUse,Drained,Reason,...}
+
+// 取消维护：节点回到正常调度；未迁走的作业继续运行，可用量不被复位。
+err = s.CancelNodeMaintenance("node-x")
+```
+
+`DrainResult{Drained,Running,InUse,Migrated,Requeued,Waiting}` 同时给出本轮
+迁走、整组重排队、仍在等待的作业清单，便于运维脚本判断与审计。
+
+### 排空与迁移规则
+
+1. **维护节点的剩余可用量不再是可放置容量**：best-fit 与作业组规划都只在
+   `NodeHealthy` 节点上进行。维护期间新作业仍可正常提交、排队、按公平次序被
+   服务到健康节点，公平结论不会因为维护动作而卡死。
+2. **非组作业：尽力而为迁移**。若存在放得下的健康节点，立即迁移：
+   `MIGRATE` 先从维护节点释放占用，再在目标节点产生一条带
+   `MIGRATED_MAINTENANCE` 原因的 `ALLOCATE`；`StartedAt` 保留，视为同一次运行
+   的延续。若当前没有健康节点放得下，作业**留在维护节点继续运行**
+   （原因 `MAINTENANCE_DRAIN_PENDING`），等它自然结束，或下一轮
+   `DrainNode`/资源归还后再试迁。
+3. **作业组：整组一致中断**（见下节）。维护节点上的组成员以 `MIGRATE` 释放，
+   其它健康节点上的同组成员以 `GROUP_REQUEUE` 释放，整组回到队列重竞争。
+4. **安全重启判定**：`DrainStatus().Drained == true` 当且仅当节点上已无运行作业。
+5. **维护可取消**：`CancelNodeMaintenance` 把节点置回健康并立即触发一轮调度；
+   维护期间已经迁走、已经整组重排队的既有结论不回滚。
+
+### 作业组在“被中断”上的整组一致性
+
+无论触发源是**计划维护**还是**节点故障**，只要组里有成员被打断，**同一个组
+的其它成员——哪怕正跑在健康节点上——也一起停下来**，整组回到排队状态重新竞争：
+
+- 不允许出现组里一部分还在跑、另一部分已排队；
+- 所有中断成员统一记排队原因 `QUEUED_GROUP_INTERRUPTED`，保留原 `SubmitSeq`
+  与已积累的老化；
+- 重新调度仍走原来的**原子放置**（一份临时可用视图上逐成员预留，任一放不下
+  则整组继续排队）与**公平次序**：要么整组在同一决策里一起再跑起来，要么整组
+  继续排队；整组重排只会落在健康节点，绝不回维护节点。
+
+四种“停止/归还”情形在流水里用不同事件类型区分，互不混淆：
+
+```
+RELEASE        正常完成 / 取消的正常归还
+MIGRATE        计划维护：占用从维护节点释放以便迁移
+EVICT          突发故障：强制驱逐
+GROUP_REQUEUE  整组一致：健康节点上的同组伙伴随中断成员一起停止
+```
+
+### 接口兼容范围
+
+- **既有接口签名与语义保持不变**：`Submit / SubmitGroup / Cancel / Complete /
+  MarkNodeUnhealthy / MarkNodeHealthy / Tick / CheckConservation / Snapshot /
+  Ledger / GetJob` 均未改签名。
+- `MarkNodeUnhealthy` 的行为增强为“故障也满足整组一致”：非组作业仍按原逻辑
+  `EVICT + 重排队`（原因仍为 `QUEUED_INSUFFICIENT_RESOURCES`），组作业则整组
+  中断（原因 `QUEUED_GROUP_INTERRUPTED`）。
+- `MarkNodeHealthy` 现在拒绝在维护节点上调用（返回 `ErrInvalidState`）；维护
+  取消必须使用 `CancelNodeMaintenance`，避免把仍有作业的维护节点可用量错误
+  复位为总量而破坏守恒。
+- 维护能力为**新增 API + 新增节点状态 + 新增流水事件/原因码**，旧调用方无需
+  改动即可继续编译运行。
+
 ## 资源流水（Ledger）
 
 `Ledger` 记录单调编号、带时间戳与原因的不可变事件：
@@ -119,11 +208,13 @@ cmd/hpcsim/      可运行演示（main.go）
        (node unhealthy: preempt and requeue)
 ```
 
-事件类型：`ALLOCATE / RELEASE / EVICT / REJECT / QUEUE / CANCEL /
-COMPLETE / NODE_DOWN / NODE_UP`。其中 `ALLOCATE` 的 delta 是加到节点的
-正量，`RELEASE / EVICT` 的 delta 是从节点已分配量中扣减的正量（事件类型
-本身即表明方向）。`Scheduler.Ledger().FormatLog()` 与 `Snapshot()` 可直接
-打印“分配流水 + 判定依据 + 集群状态”。
+事件类型：`ALLOCATE / RELEASE / EVICT / MIGRATE / GROUP_REQUEUE / REJECT /
+QUEUE / CANCEL / COMPLETE / NODE_DOWN / NODE_UP / NODE_MAINTENANCE / NODE_READY /
+DRAIN_PASS`。其中 `ALLOCATE` 的 delta 是加到节点的正量（维护迁移落地的那条带
+原因 `MIGRATED_MAINTENANCE`），`RELEASE / EVICT / MIGRATE / GROUP_REQUEUE` 的
+delta 是从节点已分配量中扣减的正量（事件类型本身即表明方向与原因）。
+`Scheduler.Ledger().FormatLog()` 与 `Snapshot()` 可直接打印“分配流水 +
+判定依据 + 集群状态”。
 
 ## 本地验证
 
@@ -142,7 +233,8 @@ go test -race -count=3 ./...
 # 覆盖率
 go test -coverprofile=cov.out ./... && go tool cover -func=cov.out
 
-# 运行端到端演示：提交/排队/拒绝/作业组/故障/恢复/老化，末尾打印完整流水
+# 运行端到端演示：前半为提交/排队/拒绝/作业组/故障/恢复/老化；
+# 后半在独立调度器上演示计划维护（整组中断、迁移失败等待、排空、取消），末尾打印两份流水
 go run ./cmd/hpcsim
 ```
 
@@ -156,6 +248,21 @@ go run ./cmd/hpcsim
   整组拒绝不留痕；
 - `TestNodeFailureEvictsAndReleases` / `TestEvictedJobKeepsQueuePosition`：
   故障驱逐、占用归零、重新排队、迁移到健康节点、恢复后可再次承载；
+- `TestFailureInterruptsWholeGroup` / `TestMaintenanceWhileGroupOnNodeFails`：
+  故障下整组一致中断（EVICT 与 GROUP_REQUEUE 可区分）、维护中节点再故障；
+- `TestMaintenanceDrainsByMigrationAndBlocksNewPlacements`：
+  维护节点不收新作业、暂不可迁时原地等待、资源归还后 `MIGRATE +
+  ALLOCATE(MIGRATED_MAINTENANCE)` 成对迁移、StartedAt 保留、排空判定；
+- `TestMaintenanceNaturalCompletion`：维护节点作业自然结束后节点判定可安全重启；
+- `TestMaintenanceInterruptsWholeGroup`：维护触发整组一致中断，MIGRATE 与
+  GROUP_REQUEUE 流水区分，容量归还后整组原子重排、绝不回维护节点；
+- `TestCancelMaintenanceReturnsNodeToService`：取消维护恢复调度、遗留作业继续
+  运行、非法状态转换（对维护节点调 MarkNodeHealthy / 重复取消等）报错；
+- `TestConcurrentMaintenanceSubmitCancel`：多节点同时维护/排空/取消与并发提交、
+  完成、取消交织，持续核对账目守恒、无重复放置，并通过流水审计确认维护期间
+  没有任何新 `ALLOCATE` 落到维护节点；
+- `TestMaintenanceDeterministicReplay`：含维护/排空/取消的相同操作序列多次
+  执行，逐作业的状态、落点、原因完全一致；
 - `TestWeightedRoundRobinAcrossQueues` / `TestAgingPreventsStarvation`：
   加权份额方向正确、低权重/低优先级不被饿死、资源归还后积压排空；
 - `TestDeterministicReplay`：相同输入序列多次执行的放置逐作业一致。

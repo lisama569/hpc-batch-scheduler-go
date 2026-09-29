@@ -353,7 +353,13 @@ func (s *Scheduler) planGroupLocked(members []*Job) (map[string]string, bool) {
 func (s *Scheduler) applyGroupPlanLocked(members []*Job, plan map[string]string) {
 	for _, m := range members {
 		node := s.nodes[plan[m.ID]]
-		s.placeLocked(m, node, fmt.Sprintf("group %q atomic placement", m.GroupID))
+		detail := fmt.Sprintf("group %q atomic placement", m.GroupID)
+		// 中断后整组重排的成员：在落地流水里保留可审计线索（原因仍为 OK，
+		// 排队事件 QUEUED_GROUP_INTERRUPTED 已记录中断原因）。
+		if m.Reason == ReasonQueuedGroupInterrupted {
+			detail = fmt.Sprintf("group %q atomic re-placement after interruption", m.GroupID)
+		}
+		s.placeLocked(m, node, detail)
 	}
 }
 
@@ -411,15 +417,25 @@ func (s *Scheduler) canPlaceLocked(j *Job, n *Node) bool {
 
 // placeLocked 在节点上放置作业、更新节点占用、队列计数并记账。
 func (s *Scheduler) placeLocked(j *Job, n *Node, detail string) {
+	s.placeLockedR(j, n, ReasonOK, detail)
+}
+
+// placeLockedR 是带显式分配原因的放置（ReasonMigratedMaintenance 用于
+// 维护迁移落地，其余常规放置传 ReasonOK）。
+func (s *Scheduler) placeLockedR(j *Job, n *Node, reason ReasonCode, detail string) {
 	n.available = n.available.Sub(j.Request)
 	n.jobs[j.ID] = j.Request
 	j.State = StateRunning
 	j.NodeName = n.Name
 	j.StartedAt = s.now()
-	j.Reason = ReasonOK
+	j.Reason = reason
 	q := s.queues[j.Queue]
 	q.running++
-	s.ledger.Allocate(j.ID, n.Name, j.Queue, j.Request, detail)
+	if reason == ReasonOK {
+		s.ledger.Allocate(j.ID, n.Name, j.Queue, j.Request, detail)
+	} else {
+		s.ledger.AllocateR(j.ID, n.Name, j.Queue, j.Request, reason, detail)
+	}
 }
 
 // removePendingLocked 从队列 pending 中删除作业。
@@ -435,6 +451,11 @@ func (s *Scheduler) removePendingLocked(j *Job) {
 }
 
 // releaseLocked 回收运行中作业占用，返回被释放的资源量。
+// 事件类型决定账目流水与可审计原因：
+//   - EvRelease：完成/取消，正常归还；
+//   - EvEvict：突发故障强制驱逐；
+//   - EvMigrate：计划维护，占用从维护节点释放以便迁移；
+//   - EvGroupRequeue：整组一致性，健康节点上的同组成员随中断成员一起停止。
 func (s *Scheduler) releaseLocked(j *Job, ev EventType, detail string) Resources {
 	n := s.nodes[j.NodeName]
 	req := n.jobs[j.ID]
@@ -445,6 +466,10 @@ func (s *Scheduler) releaseLocked(j *Job, ev EventType, detail string) Resources
 	switch ev {
 	case EvEvict:
 		s.ledger.Evict(j.ID, n.Name, j.Queue, req, detail)
+	case EvMigrate:
+		s.ledger.Migrate(j.ID, n.Name, j.Queue, req, detail)
+	case EvGroupRequeue:
+		s.ledger.GroupRequeue(j.ID, n.Name, j.Queue, req, detail)
 	default:
 		s.ledger.Release(j.ID, n.Name, j.Queue, req, detail)
 	}
@@ -495,8 +520,13 @@ func (s *Scheduler) Complete(jobID string) error {
 	return nil
 }
 
-// MarkNodeUnhealthy 标记节点不健康：驱逐全部运行作业（释放并原子记账），
-// 被驱逐作业回到原队列，保持原提交序号与年龄，随后触发一轮重调度。
+// MarkNodeUnhealthy 标记节点不健康（突发故障）：释放全部运行作业占用（原子
+// 记账），被中断作业回到原队列，保持原提交序号与年龄，随后触发一轮重调度。
+//
+// 整组一致性：若故障节点上有作业组成员，则该组所有运行成员——包括跑在健康
+// 节点上的成员——都一起停止、整组回到队列（成员间不再出现一部分在跑、
+// 一部分排队）；故障成员走 EVICT，健康成员走 GROUP_REQUEUE，便于审计区分。
+// 计划维护中的节点若突发故障，同样按故障语义强制处理（维护语义被故障取代）。
 func (s *Scheduler) MarkNodeUnhealthy(node string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -507,21 +537,41 @@ func (s *Scheduler) MarkNodeUnhealthy(node string) error {
 	if n.state == NodeUnhealthy {
 		return fmt.Errorf("%w: node %q already unhealthy", ErrInvalidState, node)
 	}
+	wasMaintenance := n.state == NodeMaintenance
 	n.state = NodeUnhealthy
-	s.ledger.Note(EvNodeDown, "", node, "", ReasonOK, "node marked unhealthy")
-
-	// 收集被驱逐作业并释放（确定性：按节点内 map 会乱序，故按提交序）。
-	var evicted []*Job
-	for id := range n.jobs {
-		evicted = append(evicted, s.jobs[id])
+	if wasMaintenance {
+		s.ledger.Note(EvNodeDown, "", node, "", ReasonOK, "node marked unhealthy while in maintenance; failure semantics apply")
+	} else {
+		s.ledger.Note(EvNodeDown, "", node, "", ReasonOK, "node marked unhealthy")
 	}
-	sort.Slice(evicted, func(i, j int) bool { return evicted[i].SubmitSeq < evicted[j].SubmitSeq })
-	for _, j := range evicted {
+
+	// 收集节点上的作业并按提交序处理（map 迭代乱序，必须显式排序以复现）。
+	var onNode []*Job
+	for id := range n.jobs {
+		onNode = append(onNode, s.jobs[id])
+	}
+	sort.Slice(onNode, func(i, j int) bool { return onNode[i].SubmitSeq < onNode[j].SubmitSeq })
+
+	handledGroups := make(map[string]bool)
+	for _, j := range onNode {
+		// 组内其它成员可能已在处理前一个成员时把该作业一并移出本节点。
+		if _, still := n.jobs[j.ID]; !still {
+			continue
+		}
+		if j.IsGrouped() {
+			if handledGroups[j.GroupID] {
+				continue
+			}
+			handledGroups[j.GroupID] = true
+			// 整组（含健康节点上的同组作业）一起停止并重新排队。
+			s.interruptGroupLocked(j.GroupID, node, causeFailure)
+			continue
+		}
+		// 非组作业：故障驱逐，占用释放后回到原队列等待迁移。
 		s.releaseLocked(j, EvEvict, "node unhealthy: preempt and requeue")
 		j.State = StateQueued
 		j.Reason = ReasonQueuedInsufficient
 		j.Detail = fmt.Sprintf("evicted from unhealthy node %s; requeued", node)
-		// 回到原队列，按原提交序插入，年龄（ageBoost/SubmitSeq）保留。
 		s.enqueueLocked(j)
 		s.ledger.Note(EvQueue, j.ID, node, j.Queue, ReasonQueuedInsufficient, "requeue after eviction")
 	}
@@ -531,7 +581,9 @@ func (s *Scheduler) MarkNodeUnhealthy(node string) error {
 	return nil
 }
 
-// MarkNodeHealthy 恢复节点健康，使其重新可被调度，并立即尝试调度。
+// MarkNodeHealthy 恢复故障节点健康，使其重新可被调度，并立即尝试调度。
+// 计划维护的取消必须使用 CancelNodeMaintenance（维护节点上可能仍有作业，
+// 不能像故障恢复那样把可用量复位为总量）。
 func (s *Scheduler) MarkNodeHealthy(node string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -541,6 +593,9 @@ func (s *Scheduler) MarkNodeHealthy(node string) error {
 	}
 	if n.state == NodeHealthy {
 		return fmt.Errorf("%w: node %q already healthy", ErrInvalidState, node)
+	}
+	if n.state == NodeMaintenance {
+		return fmt.Errorf("%w: node %q is in maintenance; use CancelNodeMaintenance instead", ErrInvalidState, node)
 	}
 	n.state = NodeHealthy
 	// 恢复时节点上应无作业（故障时已全部驱逐），可用量即总量。
