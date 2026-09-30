@@ -52,8 +52,29 @@ cmd/hpcsim/      可运行演示（main.go）
 | 队列在途作业达到 `MaxJobs` | false | `REJECTED` | `REJECT_QUEUE_FULL` |
 | 组成员组 ID 不一致等 | false | `REJECTED` | `REJECT_GROUP_MISMATCH` |
 
-关键区分：**“排队”是被接受但暂时放不下**（资源归还后会再调度），
-**“拒绝”是根本不会排队**（非法或永远不可行）。
+关键区分：**“排队”是被接受但暂时放不下**（资源归还、维护取消或节点恢复后会再
+调度），**“拒绝”是根本不会排队**（非法或永远不可行）。
+
+## 提交受理与可行性判定（与节点健康状态无关）
+
+可行性（`REJECT_INFEASIBLE`）判定**只看物理单节点总量，不看节点当前状态**：
+
+- 只要作业的单机需求**没有超过任意一台节点的 `Total`**——无论这台节点现在是
+  `HEALTHY`、`DRAINING`（维护中）还是 `UNHEALTHY`（故障）——提交就**必须被
+  正常受理**：此刻找得到健康节点就立即运行，找不到就先排队等容量（包括等维护
+  取消、等故障节点恢复）。
+- 节点状态（健康/维护/故障）只决定**“现在能不能放、放到哪台”**，绝不改变
+  **“收不收、排不排”**。因此“唯一装得下这个作业的机器正在维护/故障”时，作业
+  得到的是 `QUEUED_INSUFFICIENT_RESOURCES` 而**不是** `REJECT_INFEASIBLE`；
+  维护取消或节点恢复的同一决策内，排队作业按原来的公平次序（保留 `SubmitSeq`
+  与老化）被正常调度，不会被误拒，也不会残留状态卡住。
+- 唯一的容量类拒绝边界：单机需求**超过所有节点（含维护中、故障中）的单节点
+  总量**。因为本系统是单节点放置模型（作业不可跨节点拆分），这种请求无论等
+  多久都不可能满足，才直接判 `REJECT_INFEASIBLE`。临界值（恰好等于最大节点
+  总量）属于“可行”，即便所有节点此刻都不可用，也必须受理排队。
+- 与之配套的硬约束：维护中（`DRAINING`）/故障中（`UNHEALTHY`）的节点**绝不
+  接收任何新分配**——公平调度与作业组规划只在 `HEALTHY` 节点上选容量。排队
+  作业的落点只会是健康节点。
 
 ## 并发与一致性
 
@@ -137,7 +158,10 @@ cmd/hpcsim/      可运行演示（main.go）
    维护节点剩余的 `available` 不再被视为可放置容量；但维护节点上已在运行、
    迁不走的单作业仍持有其占用（账目照常守恒）。
 2. **提交/排队/公平不被阻塞**：维护动作与提交共用同一把锁、同一条调度路径，
-   维护期间 `Submit` 照常受理，放不下就排队，多队列 WRR 结论不变。
+   维护期间 `Submit` 照常受理，放不下就排队，多队列 WRR 结论不变。注意“放不
+   下就排队”同样以**物理可行性**为准：即使此刻唯一装得下作业的节点正好在维护
+   （或故障），作业也只是排队等它恢复，绝不会被当作“超过所有节点容量”拒绝
+   （判定规则见上文“提交受理与可行性判定”）。
 3. **单作业迁移 = 占用平移**：每轮调度开头先执行维护迁移 pass，按
    （节点名、提交序）确定性遍历，对能放入健康节点的作业在**同一决策内**记
    `MIGRATE`（源节点扣减）+ `ALLOCATE`（目标节点增加），作业保持 `RUNNING`、
@@ -211,6 +235,10 @@ go test -v ./...
 # 竞态检测 + 重复执行（并发测试在 -race 下验证）
 go test -race -count=3 ./...
 
+# 定向复现“维护/故障期间提交被误拒”的修复（4 个用例）
+go test -race -v -count=5 ./scheduler/ \
+  -run 'TestSubmitAcceptedWhenOnlyFitNodeMaintenance|TestSubmitAcceptedWhenOnlyFitNodeUnhealthy|TestRejectInfeasibleIgnoresNodeState|TestConcurrentMaintenanceSubmitAdmitAndConservation'
+
 # 覆盖率
 go test -coverprofile=cov.out ./... && go tool cover -func=cov.out
 
@@ -243,6 +271,17 @@ go run ./cmd/hpcsim
   维护与故障都保证整组重排队并原子重回，且 `MIGRATE` 与 `EVICT` 流水可区分；
 - `TestMaintenanceDeterministicReplay`：维护/迁移/整组重排队序列逐作业、
   逐事件可复现。
+- `TestSubmitAcceptedWhenOnlyFitNodeMaintenance`：唯一装得下大作业的机器在
+  维护中时，提交被接收并排队（不落到维护节点），取消维护后跑起来；
+- `TestSubmitAcceptedWhenOnlyFitNodeUnhealthy`：唯一装得下的机器故障期间，
+  同样的请求也被接收排队，节点恢复后跑起来；
+- `TestRejectInfeasibleIgnoresNodeState`：所有节点都处于维护/故障时，恰好
+  等于最大节点总量的请求仍受理排队、取消维护后运行，只有真正超过所有节点
+  单节点总量（含单维 GPU 超限）才拒绝；
+- `TestConcurrentMaintenanceSubmitAdmitAndConservation`：多节点同时维护/故障、
+  与并发提交、取消交错（`-race` 下反复执行），可行作业绝不被 `REJECT_INFEASIBLE`
+  误拒、账目始终守恒、无双重放置、维护/故障节点上不出现新分配，全部恢复后
+  排队作业被正常调度清空。
 
 ## 接口兼容范围
 
@@ -265,8 +304,10 @@ go run ./cmd/hpcsim
 
 ## 工程取舍说明
 
-- 单节点放置模型：一个作业不可跨节点拆分，因此“超过单节点容量”的请求
-  直接判 `REJECT_INFEASIBLE`，而不是无意义地长期排队。
+- 单节点放置模型：一个作业不可跨节点拆分，因此“超过单节点容量”的请求直接判
+  `REJECT_INFEASIBLE`，而不是无意义地长期排队。这里的“单节点容量”取**所有
+  节点（含维护中、故障中）物理 `Total` 的最大值**，与节点当前状态无关——状态
+  只影响落点，不影响受理；只是“当前没有健康节点放得下”时一律受理排队。
 - 公平优先于局部最优：同一份资源若多个队列竞争，由 WRR 决定归属，而不是
   谁先提交谁拿走；提交与调度解耦后，即时模式仍在同一把锁内完成“入队+裁决”，
   对调用方而言提交返回时结论已经确定。

@@ -93,7 +93,9 @@ const (
 	ReasonQueuedGroupAtomic ReasonCode = "QUEUED_GROUP_ATOMIC"
 	// ReasonRejectInvalid 资源声明非法（负数/全零）。
 	ReasonRejectInvalid ReasonCode = "REJECT_INVALID_REQUEST"
-	// ReasonRejectInfeasible 集群总容量永远无法满足该请求。
+	// ReasonRejectInfeasible 单机需求超过所有节点（含维护中、故障中）的单节点
+	// 总量，在单节点放置模型下永远无法满足。注意：只是“当前没有健康节点放得下”
+	// 不算不可行——那种情况作业会被接收并排队，等维护取消/节点恢复后再调度。
 	ReasonRejectInfeasible ReasonCode = "REJECT_INFEASIBLE"
 	// ReasonRejectDuplicate 作业 ID 重复。
 	ReasonRejectDuplicate ReasonCode = "REJECT_DUPLICATE_ID"
