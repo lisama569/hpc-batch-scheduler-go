@@ -143,18 +143,21 @@ func (s *Scheduler) validateRequestLocked(j Job) (ReasonCode, string) {
 				fmt.Sprintf("group %q already submitted as a unit; add members via SubmitGroup", j.GroupID)
 		}
 	}
-	// 可行性：任一当前可放置节点（健康；维护/故障节点不接收新作业）都放不下
-	// => 此刻不可行。注意这不是“永久不可行”：待节点恢复/维护取消后可再提交，
-	// 因此容量类拒绝仍与非法请求一样可由调用方稍后重试。
+	// 可行性（只看物理总量，与节点当前状态无关）：只要存在任意一台节点——
+	// 无论 HEALTHY / DRAINING / UNHEALTHY——其单节点 Total 装得下 req，
+	// 作业就必须被受理：此刻有健康容量就立即运行，没有就排队等待
+	// （等维护取消、等故障恢复、等占用归还）。节点状态只决定“现在能不能放、
+	// 放到哪台”，不决定“收不收、排不排”。只有 req 超过所有节点的单节点
+	// 总量时才是真正永久不可行，直接拒绝。
 	feasible := false
 	for _, n := range s.nodes {
-		if n.state == NodeHealthy && n.Total.Fits(req) {
+		if n.Total.Fits(req) {
 			feasible = true
 			break
 		}
 	}
 	if !feasible {
-		return ReasonRejectInfeasible, fmt.Sprintf("request %s exceeds every node capacity", req)
+		return ReasonRejectInfeasible, fmt.Sprintf("request %s exceeds every node total capacity (healthy, draining and unhealthy nodes counted)", req)
 	}
 	// 队列在途上限
 	if q := s.queues[j.Queue]; q.cfg.MaxJobs > 0 && q.running+len(q.pending) >= q.cfg.MaxJobs {

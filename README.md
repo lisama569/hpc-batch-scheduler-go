@@ -46,7 +46,7 @@ cmd/hpcsim/      可运行演示（main.go）
 | 资源暂时不足，保持排队 | true | `QUEUED` | `QUEUED_INSUFFICIENT_RESOURCES` |
 | 作业组当前无法整体满足，保持排队 | true | `QUEUED` | `QUEUED_GROUP_ATOMIC` |
 | 资源声明非法（负数/全零/无 ID） | false | `REJECTED` | `REJECT_INVALID_REQUEST` |
-| 超过所有节点容量，永远不可调度 | false | `REJECTED` | `REJECT_INFEASIBLE` |
+| 超过**所有**节点（含维护中、故障中）的单节点物理总量，任何状态下都放不下 | false | `REJECTED` | `REJECT_INFEASIBLE` |
 | 作业 ID 重复 | false | `REJECTED` | `REJECT_DUPLICATE_ID` |
 | 队列不存在 | false | `REJECTED` | `REJECT_NO_QUEUE` |
 | 队列在途作业达到 `MaxJobs` | false | `REJECTED` | `REJECT_QUEUE_FULL` |
@@ -54,6 +54,32 @@ cmd/hpcsim/      可运行演示（main.go）
 
 关键区分：**“排队”是被接受但暂时放不下**（资源归还后会再调度），
 **“拒绝”是根本不会排队**（非法或永远不可行）。
+
+## 提交受理与可行性判定（维护/故障期间）
+
+可行性判定**只看各节点的物理总量 `Total`，与节点当前状态无关**：
+
+- 只要存在**任意一台**节点（无论 `HEALTHY` / `DRAINING` / `UNHEALTHY`）
+  的单节点总量装得下作业请求，提交就**必须被正常受理**：
+  - 当前有健康容量 → 立即由公平调度器放置（`OK`）；
+  - 当前没有健康容量（唯一装得下的机器在维护/故障、或健康节点被占满）
+    → 进入排队（`QUEUED_INSUFFICIENT_RESOURCES`；作业组为
+    `QUEUED_GROUP_ATOMIC`），等待占用归还、维护取消或故障恢复。
+- 只有当单机需求确实超过**所有**节点（含维护中、故障中）的单节点总量时，
+  才按永久不可行直接拒绝（`REJECT_INFEASIBLE`）。
+
+即：**节点状态只决定“现在能不能放、放到哪台机器”，不决定“收不收、
+排不排”**。维护/故障不会把任何“物理上可行”的提交变成拒绝；排队作业
+保留原 `SubmitSeq` 与老化，容量回来（`CancelMaintenance` /
+`MarkNodeHealthy` / 作业结束释放）后按原有公平次序被调度，不会被误拒，
+也不会因残留状态卡住。与此同时，`DRAINING` 与 `UNHEALTHY` 节点
+**绝不会承载任何新提交的作业**（best-fit、组规划、维护迁移的目标选择
+都只看 `HEALTHY` 节点）。
+
+典型场景：集群里唯一装得下某大作业的机器被拉入维护（或被标记故障）后
+提交该作业 → 返回 `Accepted=true, State=QUEUED`；取消维护/恢复节点后
+作业立即跑起来。只有请求超过全集群最大单节点总量时，才无论节点状态如何
+都返回 `REJECT_INFEASIBLE`。
 
 ## 并发与一致性
 
@@ -137,7 +163,9 @@ cmd/hpcsim/      可运行演示（main.go）
    维护节点剩余的 `available` 不再被视为可放置容量；但维护节点上已在运行、
    迁不走的单作业仍持有其占用（账目照常守恒）。
 2. **提交/排队/公平不被阻塞**：维护动作与提交共用同一把锁、同一条调度路径，
-   维护期间 `Submit` 照常受理，放不下就排队，多队列 WRR 结论不变。
+   维护期间 `Submit` 照常受理：唯一装得下的机器在维护/故障时作业排队等待，
+   绝不因此被拒；只有超过所有节点单节点总量（与节点状态无关）才拒绝
+   （详见“提交受理与可行性判定”）。放不下就排队，多队列 WRR 结论不变。
 3. **单作业迁移 = 占用平移**：每轮调度开头先执行维护迁移 pass，按
    （节点名、提交序）确定性遍历，对能放入健康节点的作业在**同一决策内**记
    `MIGRATE`（源节点扣减）+ `ALLOCATE`（目标节点增加），作业保持 `RUNNING`、
@@ -243,6 +271,46 @@ go run ./cmd/hpcsim
   维护与故障都保证整组重排队并原子重回，且 `MIGRATE` 与 `EVICT` 流水可区分；
 - `TestMaintenanceDeterministicReplay`：维护/迁移/整组重排队序列逐作业、
   逐事件可复现。
+- `TestSubmitAcceptedQueuedWhenOnlyFittingNodeInMaintenance` /
+  `...WhenOnlyFittingNodeUnhealthy`：唯一装得下的机器在维护/故障中时提交仍被
+  接收并排队，取消维护/恢复后作业跑起来，且排队期间绝不落到不可用节点；
+- `TestSubmitRejectedWhenExceedsEveryNodeTotal`：只有超过所有节点（含维护中、
+  故障中）单节点总量的请求才被拒，各资源维分别校验，拒绝不留任何在途痕迹；
+- `TestQueuedDuringMaintenanceKeepsFairOrderAcrossRecovery`：维护期间积压的
+  作业恢复后按原提交次序依次被调度，不被误拒、不残留卡住；
+- `TestMultipleNodesDownSubmitStillQueuedAndDrain`：多台机器同时维护时提交
+  照常受理排队、逐台恢复后按序排空，维护机器上始终不出现新分配；
+- `TestConcurrentSubmitAcrossMaintenanceNoFalseReject`：多节点反复维护/取消、
+  故障/恢复叠加并发提交与并发取消，全程账目守恒、零误拒，并依据流水区间
+  审计 `DRAINING`/`UNHEALTHY` 节点上不出现任何新 `ALLOCATE`（`-race` 下验证）。
+
+## 本地复现该缺陷与验证修复
+
+最小复现（修复前：唯一装得下的机器进入维护后，大作业提交被误判
+`REJECT_INFEASIBLE` 拒绝；修复后：接收并排队，取消维护后运行）：
+
+```go
+s := scheduler.New()
+s.AddNode("n-big", scheduler.Resources{CPU: 16, MemoryMB: 32000, GPU: 4})
+s.AddNode("n-small", scheduler.Resources{CPU: 8, MemoryMB: 16000, GPU: 2})
+s.AddQueue(scheduler.QueueConfig{Name: "batch", Weight: 1})
+
+s.MarkNodeMaintenance("n-big", "rolling upgrade")
+r := s.Submit(scheduler.Job{ID: "big", Queue: "batch",
+    Request: scheduler.Resources{CPU: 12, MemoryMB: 20000, GPU: 3}})
+// 修复前：r.Accepted == false, r.Reason == REJECT_INFEASIBLE（错误）
+// 修复后：r.Accepted == true,  r.State == QUEUED
+s.CancelMaintenance("n-big")
+// 修复后：big 立即在 n-big 上 RUNNING
+```
+
+命令行验证：
+
+```bash
+go test -run 'TestSubmitAcceptedQueuedWhenOnlyFittingNode|TestSubmitRejectedWhenExceedsEveryNodeTotal' -v ./...
+go test -race -run 'TestConcurrentSubmitAcrossMaintenanceNoFalseReject' -count=3 ./...
+go test -race -count=3 ./...   # 全量回归（提交/排队/取消/公平/故障/维护）
+```
 
 ## 接口兼容范围
 
@@ -265,8 +333,10 @@ go run ./cmd/hpcsim
 
 ## 工程取舍说明
 
-- 单节点放置模型：一个作业不可跨节点拆分，因此“超过单节点容量”的请求
-  直接判 `REJECT_INFEASIBLE`，而不是无意义地长期排队。
+- 单节点放置模型：一个作业不可跨节点拆分，因此“超过所有节点单节点总量”的
+  请求直接判 `REJECT_INFEASIBLE`（判定只看物理总量，不看节点健康/维护/故障
+  状态），而不是无意义地长期排队；反之，只要任一节点（哪怕正在维护或故障）
+  的总量装得下，提交就被受理，暂时没有健康容量则排队等待恢复。
 - 公平优先于局部最优：同一份资源若多个队列竞争，由 WRR 决定归属，而不是
   谁先提交谁拿走；提交与调度解耦后，即时模式仍在同一把锁内完成“入队+裁决”，
   对调用方而言提交返回时结论已经确定。
